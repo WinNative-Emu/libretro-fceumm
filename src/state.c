@@ -189,6 +189,32 @@ static INLINE void sf_flip(void *v, uint32_t s)
    else
       FlipByteOrderStrided((uint8_t *)v, size, stride);
 }
+
+/* Nonzero while loading a savestate written by a core whose
+ * FlipByteOrder was the historical no-op (loop bound was 'count'
+ * instead of 'count/2', so every even-sized - i.e. every multi-byte -
+ * RLSB field was left untouched). Such cores wrote RLSB fields in
+ * HOST byte order, so on a big-endian machine the file stores
+ * big-endian values and the load-side swap must be skipped or every
+ * multi-byte field comes back byte-reversed.
+ *
+ * Detection is by header version: FCEU_VERSION_NUMERIC was 9813 from
+ * the beginning of the fork through the FlipByteOrder fix, and is
+ * bumped to 9900 together with this change. A state carrying an older
+ * version on a big-endian host is assumed to be host-order, because
+ * cross-endian state transport never worked while the no-op bug was
+ * present - the only old-version states that load correctly on this
+ * machine are ones it (or a machine of the same endianness) saved.
+ *
+ * Known limitation: a state saved by a big-endian build from the
+ * short window between the FlipByteOrder fix and this version bump is
+ * canonical little-endian but still carries version 9813, so it will
+ * be mis-decoded once; the same goes for a little-endian 9813 state
+ * copied onto a big-endian machine. Re-saving writes version 9900 in
+ * canonical order and heals the file. The alternative - sniffing
+ * field contents to guess the byte order - is non-deterministic and
+ * was rejected. */
+static int state_legacy_hostorder;
 #endif
 
 extern SFORMAT FCEUPPU_STATEINFO[];
@@ -327,7 +353,10 @@ static int ReadStateChunk(memstream_t *mem, SFORMAT *sf, int size)
             return 0;
 
 #ifdef MSB_FIRST
-         if(tmp->s & RLSB)
+         /* Legacy host-order states (see state_legacy_hostorder) already
+          * hold big-endian bytes; swapping them would corrupt every
+          * multi-byte field. */
+         if ((tmp->s & RLSB) && !state_legacy_hostorder)
             sf_flip(tmp->v, tmp->s);
 #endif
       }
@@ -494,6 +523,15 @@ void FCEUSS_Load_Mem(const void *buf, size_t size)
       stateversion = FCEU_de32lsb(header + 8);
    else
       stateversion = header[3] * 100;
+
+#ifdef MSB_FIRST
+   /* Anything below 9900 predates the FlipByteOrder fix and stores
+    * RLSB fields in the saving host's byte order; on this (big-endian)
+    * host that means the file is big-endian and the load-side swap
+    * must be skipped. The header[3] != 0xFF form is the ancient
+    * FCEU-desktop encoding and is always legacy. */
+   state_legacy_hostorder = !(header[3] == 0xFF && stateversion >= 9900);
+#endif
 
    /* totalsize on disk is unsigned 32-bit. The previous code stored it
     * straight into a signed int, so a malicious header with bit 31 set
