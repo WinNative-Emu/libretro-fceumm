@@ -23,7 +23,6 @@
 
 #include <string.h>
 
-#include <streams/memory_stream.h>
 
 #include "fceu-memory.h"
 #include "fceu-types.h"
@@ -36,6 +35,6 @@ uint32_t FCEU_de32lsb(const uint8_t *morp)
    memcpy(&v, morp, 4);
    return v;
 #else
-   return(morp[0] | (morp[1] << 8) | (morp[2] << 16) | (morp[3] << 24));
+   return((uint32_t)morp[0] | ((uint32_t)morp[1] << 8) | ((uint32_t)morp[2] << 16) | ((uint32_t)morp[3] << 24));
 #endif
 }

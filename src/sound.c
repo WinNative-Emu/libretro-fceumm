@@ -172,6 +172,40 @@ static uint8_t DMCShift = 0;
 static uint8_t SIRQStat = 0;
 
 static char DMCHaveDMA = 0;
+
+/* The CPU adds each instruction's cycles to FCEU_SoundCycles and runs
+ * FCEU_SoundCPUHook only when they reach FCEU_SoundNext: the next frame
+ * sequencer step, DMC timer tick or pending DMC DMA. Those land on the
+ * same instruction boundary as a hook run every instruction; in between
+ * the hook would only count cycles. */
+int32_t FCEU_SoundCycles = 0;
+int32_t FCEU_SoundNext = 0;
+
+static void SoundSchedule(void)
+{
+	int32_t next;
+
+	if (DMCSize && !DMCHaveDMA) {
+		FCEU_SoundNext = 0;
+		return;
+	}
+	/* Cycles until fhcnt, counted 48 per cycle, reaches zero. */
+	next = fhcnt > 0 ? (fhcnt + 47) / 48 : 0;
+	if (DMCacc < next)
+		next = DMCacc > 0 ? DMCacc : 0;
+	FCEU_SoundNext = next;
+}
+
+/* Applies the cycles counted since the hook last ran. They stop short
+ * of the next event, so nothing but the counters changes. */
+static void SoundSync(void)
+{
+	if (FCEU_SoundCycles) {
+		int32_t c = FCEU_SoundCycles;
+		FCEU_SoundCycles = 0;
+		FCEU_SoundCPUHook(c);
+	}
+}
 static uint8_t DMCDMABuf = 0;
 static char DMCHaveSample = 0;
 
@@ -354,6 +388,7 @@ static DECLFW(Write_DMCRegs) {
 static DECLFW(StatusWrite) {
 	int x;
 
+	SoundSync();
 	DoSQ1();
 	DoSQ2();
 	DoTriangle();
@@ -372,6 +407,7 @@ static DECLFW(StatusWrite) {
 	SIRQStat &= ~0x80;
 	X6502_IRQEnd(FCEU_IQDPCM);
 	EnabledChannels = V & 0x1F;
+	SoundSchedule();
 }
 
 static DECLFR(StatusRead) {
@@ -552,6 +588,7 @@ void FASTAPASS(1) FCEU_SoundCPUHook(int cycles) {
 		DMCShift >>= 1;
 		tester();
 	}
+	SoundSchedule();
 }
 
 static void RDoPCM(void) {
@@ -565,6 +602,19 @@ static void RDoPCM(void) {
 }
 
 /* This has the correct phase.  Don't mess with it. */
+/* Adds 'value' to each of the n high-quality mix slots from D. */
+static void WaveHiAddRun(int32_t *D, int32_t n, int32_t value) {
+	int32_t i;
+	for (i = 0; i < n; i++)
+		D[i] += value;
+}
+
+/* Steps of a span that ends at the step a wave length counter reaches
+ * zero, capped at 'left'; a counter at or below zero only counts down
+ * and never reaches it. */
+#define HQ_SPAN(count, left) \
+	(((count) > 0 && (count) < (left)) ? (count) : (left))
+
 static INLINE void RDoSQ(int x) {
 	int32_t V;
 	int32_t amp;
@@ -610,16 +660,20 @@ static INLINE void RDoSQ(int x) {
 		currdc = RectDutyCount[x];
 		D = &WaveHi[ChannelBC[x]];
 
+		/* The output only changes when the duty step advances: each
+		 * span up to that step goes into the mix at once, and adds
+		 * nothing while the step is past the duty threshold. */
 		while (V > 0) {
+			int32_t n = HQ_SPAN(rc, V);
 			if (currdc < rthresh)
-				*D += amp;
-			rc--;
+				WaveHiAddRun(D, n, amp);
+			D  += n;
+			V  -= n;
+			rc -= n;
 			if (!rc) {
 				rc = cf;
 				currdc = (currdc + 1) & 7;
 			}
-			V--;
-			D++;
 		}
 
 		RectDutyCount[x] = currdc;
@@ -636,6 +690,25 @@ static void RDoSQ1(void) {
 static void RDoSQ2(void) {
 	RDoSQ(1);
 }
+
+/* Adds 'value' to the low-quality mix for steps [v, v + n): sixteen
+ * steps per Wave slot, so a run of steps adds value times its count to
+ * each slot it covers. */
+static void WaveAddRun(int32_t v, int32_t n, int32_t value) {
+	while (n > 0) {
+		int32_t cnt = 16 - (v & 15);
+		if (cnt > n)
+			cnt = n;
+		Wave[v >> 4] += value * cnt;
+		v += cnt;
+		n -= cnt;
+	}
+}
+
+/* Steps until an accumulator that loses 'inie' per step reaches zero
+ * (counting the step that reaches it); -1 when it never does. */
+#define LQ_STEPS_TO_EVENT(acc, inie) \
+	(!(inie) ? -1 : ((acc) <= 0 ? 1 : ((acc) - 1) / (inie) + 1))
 
 static void RDoSQLQ(void) {
 	int32_t start, end;
@@ -715,20 +788,24 @@ static void RDoSQLQ(void) {
 		 * to Wave[V>>4] - genuinely no-op for ~30000 NES cycles
 		 * per frame. Skip the loop entirely. */
 	} else {
-		for (V = start; V < end; V++) {
-			/* int tmpamp=0;
-			if(RectDutyCount[0]<rthresh[0])
-			 tmpamp=amp[0];
-			if(RectDutyCount[1]<rthresh[1])
-			 tmpamp+=amp[1];
-			tmpamp=wlookup1[tmpamp];
-			tmpamp = wlookup1[ ttable[0][RectDutyCount[0]] + ttable[1][RectDutyCount[1]] ];
-			*/
+		/* The output only changes when a channel's accumulator runs
+		 * out, so each span up to the next such step goes into the mix
+		 * at once. */
+		for (V = start; V < end; ) {
+			int32_t n = end - V;
+			int32_t k;
 
-			Wave[V >> 4] += totalout;	/* tmpamp; */
+			k = LQ_STEPS_TO_EVENT(sqacc[0], inie[0]);
+			if (k >= 0 && k < n)
+				n = k;
+			k = LQ_STEPS_TO_EVENT(sqacc[1], inie[1]);
+			if (k >= 0 && k < n)
+				n = k;
 
-			sqacc[0] -= inie[0];
-			sqacc[1] -= inie[1];
+			WaveAddRun(V, n, totalout);
+			V += n;
+			sqacc[0] -= n * inie[0];
+			sqacc[1] -= n * inie[1];
 
 			if (sqacc[0] <= 0) {
  rea:
@@ -781,9 +858,13 @@ static void RDoTriangle(void) {
 			WaveHi[V] += cout; */
 
 	} else {
-		for (V = ChannelBC[2]; V < SOUNDTS; V++) {
-			WaveHi[V] += (tcout / 256 * FSettings.TriangleVolume) & (~0xFFFF);  /* TODO OPTIMIZE ME! */
-			wlcount[2]--;
+		/* Spans between steps of the wave go into the mix at once. */
+		for (V = ChannelBC[2]; V < SOUNDTS; ) {
+			int32_t n = HQ_SPAN(wlcount[2], (int32_t)(SOUNDTS - V));
+			WaveHiAddRun(&WaveHi[V], n,
+					(tcout / 256 * FSettings.TriangleVolume) & (~0xFFFF));
+			V += n;
+			wlcount[2] -= n;
 			if (!wlcount[2]) {
 				wlcount[2] = (PSG[0xa] | ((PSG[0xb] & 7) << 8)) + 1;
 				tristep++;
@@ -792,7 +873,7 @@ static void RDoTriangle(void) {
 				tcout = (tcout * 3) << 16;
 			}
 		}
-    }
+	}
 
 	ChannelBC[2] = SOUNDTS;
 }
@@ -864,86 +945,53 @@ static void RDoTriangleNoisePCMLQ(void) {
 
 	totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
 
-	if (inie[0] && inie[1]) {
-		for (V = start; V < end; V++) {
-			Wave[V >> 4] += totalout;
+	/* As in RDoSQLQ: spans between accumulator events go into the mix
+	 * at once. A channel with no increment never has one. */
+	for (V = start; V < end; ) {
+		int32_t n = end - V;
+		int32_t k;
 
-			lq_triacc -= inie[0];
-			lq_noiseacc -= inie[1];
+		k = LQ_STEPS_TO_EVENT(lq_triacc, inie[0]);
+		if (k >= 0 && k < n)
+			n = k;
+		k = LQ_STEPS_TO_EVENT(lq_noiseacc, inie[1]);
+		if (k >= 0 && k < n)
+			n = k;
 
-			if (lq_triacc <= 0) {
+		WaveAddRun(V, n, totalout);
+		V += n;
+		lq_triacc   -= n * inie[0];
+		lq_noiseacc -= n * inie[1];
+
+		if (inie[0] && lq_triacc <= 0) {
  rea:
-				lq_triacc += freq[0];	/* t; */
-				tristep = (tristep + 1) & 0x1F;
-				if (lq_triacc <= 0) goto rea;
-				lq_tcout = (tristep & 0xF);
-				if (!(tristep & 0x10)) lq_tcout ^= 0xF;
-				lq_tcout = lq_tcout * 3;
-				scaled_tcout = (tri_vol != 256)
-				             ? ((lq_tcout * tri_vol) / 256)
-				             : lq_tcout;
-				totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
-			}
+			lq_triacc += freq[0];	/* t; */
+			tristep = (tristep + 1) & 0x1F;
+			if (lq_triacc <= 0) goto rea;
+			lq_tcout = (tristep & 0xF);
+			if (!(tristep & 0x10)) lq_tcout ^= 0xF;
+			lq_tcout = lq_tcout * 3;
+			scaled_tcout = (tri_vol != 256)
+			             ? ((lq_tcout * tri_vol) / 256)
+			             : lq_tcout;
+			totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
+		}
 
-			if (lq_noiseacc <= 0) {
+		if (inie[1] && lq_noiseacc <= 0) {
  rea2:
-				/* used to added <<(16+2) when the noise table
-				 * values were half.
-				 */
-				if (PAL)
-					lq_noiseacc += PALNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
-				else
-					lq_noiseacc += NTSCNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
-				nreg = (nreg << 1) + (((nreg >> nshift) ^ (nreg >> 14)) & 1);
-				nreg &= 0x7fff;
-				noiseout = amptab[(nreg >> 0xe) & 1];
-				if (lq_noiseacc <= 0) goto rea2;
-				totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
-			}	/* noiseacc<=0 */
-		}	/* for(V=... */
-	} else if (inie[0]) {
-		for (V = start; V < end; V++) {
-			Wave[V >> 4] += totalout;
-
-			lq_triacc -= inie[0];
-
-			if (lq_triacc <= 0) {
- area:
-				lq_triacc += freq[0];	/* t; */
-				tristep = (tristep + 1) & 0x1F;
-				if (lq_triacc <= 0) goto area;
-				lq_tcout = (tristep & 0xF);
-				if (!(tristep & 0x10)) lq_tcout ^= 0xF;
-				lq_tcout = lq_tcout * 3;
-				scaled_tcout = (tri_vol != 256)
-				             ? ((lq_tcout * tri_vol) / 256)
-				             : lq_tcout;
-				totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
-			}
+			/* used to added <<(16+2) when the noise table
+			 * values were half.
+			 */
+			if (PAL)
+				lq_noiseacc += PALNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
+			else
+				lq_noiseacc += NTSCNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
+			nreg = (nreg << 1) + (((nreg >> nshift) ^ (nreg >> 14)) & 1);
+			nreg &= 0x7fff;
+			noiseout = amptab[(nreg >> 0xe) & 1];
+			if (lq_noiseacc <= 0) goto rea2;
+			totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
 		}
-	} else if (inie[1]) {
-		for (V = start; V < end; V++) {
-			Wave[V >> 4] += totalout;
-			lq_noiseacc -= inie[1];
-			if (lq_noiseacc <= 0) {
- area2:
-				/* used to be added <<(16+2) when the noise table
-				 * values were half.
-				 */
-				if (PAL)
-					lq_noiseacc += PALNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
-				else
-					lq_noiseacc += NTSCNoiseFreqTable[PSG[0xE] & 0xF] << (16 + 1);
-				nreg = (nreg << 1) + (((nreg >> nshift) ^ (nreg >> 14)) & 1);
-				nreg &= 0x7fff;
-				noiseout = amptab[(nreg >> 0xe) & 1];
-				if (lq_noiseacc <= 0) goto area2;
-				totalout = wl2(scaled_tcout + noiseout + scaled_dmc);
-			}	/* noiseacc<=0 */
-		}
-	} else {
-		for (V = start; V < end; V++)
-			Wave[V >> 4] += totalout;
 	}
 }
 
@@ -951,6 +999,7 @@ static void RDoNoise(void) {
 	uint32_t V;
 	int32_t outo;
 	uint32_t amptab[2];
+	int fbit;
 
 	if (EnvUnits[2].Mode & 0x1)
 		amptab[0] = EnvUnits[2].Speed;
@@ -976,43 +1025,31 @@ static void RDoNoise(void) {
 		outo = amptab[0] = 0;
 	}
 
-	if (PSG[0xE] & 0x80) {/* "short" noise */
-		for (V = ChannelBC[3]; V < SOUNDTS; V++) {
-			WaveHi[V] += outo;
-			wlcount[3]--;
-			if (!wlcount[3]) {
-				uint8_t feedback;
-				if (PAL)
-					wlcount[3] = PALNoiseFreqTable[PSG[0xE] & 0xF];
-				else
-					wlcount[3] = NTSCNoiseFreqTable[PSG[0xE] & 0xF];
-				feedback = ((nreg >> 8) & 1) ^ ((nreg >> 14) & 1);
-				nreg = (nreg << 1) + feedback;
-				nreg &= 0x7fff;
-				outo = amptab[(nreg >> 0xe) & 1];
-			}
-		}
-	} else {
-		for (V = ChannelBC[3]; V < SOUNDTS; V++) {
-			WaveHi[V] += outo;
-			wlcount[3]--;
-			if (!wlcount[3]) {
-				uint8_t feedback;
-				if (PAL)
-					wlcount[3] = PALNoiseFreqTable[PSG[0xE] & 0xF];
-				else
-					wlcount[3] = NTSCNoiseFreqTable[PSG[0xE] & 0xF];
-				feedback = ((nreg >> 13) & 1) ^ ((nreg >> 14) & 1);
-				nreg = (nreg << 1) + feedback;
-				nreg &= 0x7fff;
-				outo = amptab[(nreg >> 0xe) & 1];
-			}
+	/* Feedback from bit 8 for "short" noise, bit 13 otherwise. Spans
+	 * between shifts of the register go into the mix at once. */
+	fbit = (PSG[0xE] & 0x80) ? 8 : 13;
+	for (V = ChannelBC[3]; V < SOUNDTS; ) {
+		int32_t n = HQ_SPAN(wlcount[3], (int32_t)(SOUNDTS - V));
+		WaveHiAddRun(&WaveHi[V], n, outo);
+		V += n;
+		wlcount[3] -= n;
+		if (!wlcount[3]) {
+			uint8_t feedback;
+			if (PAL)
+				wlcount[3] = PALNoiseFreqTable[PSG[0xE] & 0xF];
+			else
+				wlcount[3] = NTSCNoiseFreqTable[PSG[0xE] & 0xF];
+			feedback = ((nreg >> fbit) & 1) ^ ((nreg >> 14) & 1);
+			nreg = (nreg << 1) + feedback;
+			nreg &= 0x7fff;
+			outo = amptab[(nreg >> 0xe) & 1];
 		}
 	}
 	ChannelBC[3] = SOUNDTS;
 }
 
 static DECLFW(Write_IRQFM) {
+	SoundSync();
 	V = (V & 0xC0) >> 6;
 	fcnt = 0;
 	if (V & 2)
@@ -1024,6 +1061,7 @@ static DECLFW(Write_IRQFM) {
 		SIRQStat &= ~0x40;
 	}
 	IRQFrameMode = V;
+	SoundSchedule();
 }
 
 void SetNESSoundMap(void) {
@@ -1039,6 +1077,9 @@ static int32_t inbuf = 0;
 int FlushEmulateSound(void) {
 	int x;
 	int32_t end, left;
+
+	/* Savestates are taken between frames: leave the counters exact. */
+	SoundSync();
 
 	if (!sound_timestamp) return(0);
 
@@ -1186,11 +1227,14 @@ void FCEUSND_Reset(void) {
 	DMCShift = 0;
 	DMCacc=1;
 	DMCBitCount=0;
+	FCEU_SoundCycles = 0;
+	SoundSchedule();
 }
 
 void FCEUSND_Power(void) {
 	int x;
 
+	FCEUSS_SetHostChunk(FCEUSS_CHUNK_SOUND, &neofilter_state_chunk);
 	SetNESSoundMap();
 	memset(PSG, 0x00, sizeof(PSG));
 	FCEUSND_Reset();
@@ -1447,6 +1491,7 @@ void FCEUSND_SaveState(void) {
 
 void FCEUSND_LoadState(int version) {
 	int i;
+	FCEU_SoundCycles = 0;
 	LoadDMCPeriod(DMCFormat & 0xF);
 	RawDALatch &= 0x7F;
 	DMCAddress &= 0x7FFF;
@@ -1484,15 +1529,6 @@ void FCEUSND_LoadState(int version) {
 		}
 	}
 
-	/* Comparison is always false because access to array >= 0. */
-	/* if (sound_timestamp < 0)
-	{
-		sound_timestamp = 0;
-	}
-	if (soundtsoffs < 0)
-	{
-		soundtsoffs = 0;
-	} */
 	if (soundtsoffs + sound_timestamp >= soundtsinc)
 	{
 		soundtsoffs = 0;
@@ -1502,4 +1538,5 @@ void FCEUSND_LoadState(int version) {
 	{
 		tristep &= 0x1F;
 	}
+	SoundSchedule();
 }

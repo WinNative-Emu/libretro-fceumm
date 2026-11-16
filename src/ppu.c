@@ -86,7 +86,7 @@ static void makeppulut(void) {
 				int shiftr;
 				shiftr = (pixel + xo) / 8;
 				shiftr *= 2;
-				ppulut3[xo | (cc << 3)] |= ((cc >> shiftr) & 3) << (2 + pixel * 4);
+				ppulut3[xo | (cc << 3)] |= (uint32_t)((cc >> shiftr) & 3) << (2 + pixel * 4);
 			}
 		}
 	}
@@ -135,44 +135,6 @@ uint8_t UPALRAM[0x03];/* for 0x4/0x8/0xC addresses in palette, the ones in
 					 * 0x20 are 0 to not break fceu rendering.
 					 */
 
-/* Background pair LUT for pputile.h's per-tile 8-pixel palette gather.
- * Each 8-bit chunk of pixdata indexes two 4-bit pens (low nibble = even
- * pixel, high nibble = odd), so a 256-entry uint16_t table maps each
- * pixdata byte to a pre-packed 2-pen pair, letting the per-tile body
- * emit four pair-lookups and a single 64-bit store instead of eight
- * serial nibble-load-store iterations.
- *
- * Rebuilt INSIDE RefreshLine just before the pputile.h includes, so
- * that:
- *   (a) any PALRAM[0x00..0x0F] change since the previous RefreshLine
- *       is reflected on the next tile span, and
- *   (b) crucially, the 0x40 "background priority" bit that RefreshLine
- *       OR's into Pal[0/4/8/0xC] right before rendering -- and ANDs
- *       off again after -- is captured in the LUT.  Without that the
- *       sprite compositor cannot tell BG-color pixels apart from the
- *       universal background, breaking sprite priority for any game
- *       that hits Pal[0x04/0x08/0x0C] (e.g. Mega Man 3 sprites). */
-static uint16_t fceu_bg_pair_lut[256];
-
-static void FCEU_BuildBgPairLUT(void)
-{
-	int b;
-	for (b = 0; b < 256; b++)
-	{
-#ifdef MSB_FIRST
-		/* Big-endian: the 64-bit tile word in pputile.h is stored
-		 * most-significant byte first, so the even (leftmost) pen of
-		 * each pair must live in the HIGH byte of the LUT entry for
-		 * it to land at the lower memory address. */
-		fceu_bg_pair_lut[b] = ((uint16_t)PALRAM[b & 0x0F] << 8) |
-		                       (uint16_t)PALRAM[b >> 4];
-#else
-		fceu_bg_pair_lut[b] = (uint16_t)PALRAM[b & 0x0F] |
-		                      ((uint16_t)PALRAM[b >> 4] << 8);
-#endif
-	}
-}
-
 #define MMC5SPRVRAMADR(V)   &MMC5SPRVPage[(V) >> 10][(V)]
 #define VRAMADR(V)          &VPage[(V) >> 10][(V)]
 
@@ -186,10 +148,22 @@ static uint8_t * MMC5BGVRAMADR(uint32_t V) {
 	} else return &MMC5BGVPage[(V) >> 10][(V)];
 }
 
+/* Sprite 0 on the current line, until its hit is found (0x100: none). */
+static int32_t sphitx;
+static uint8_t sphitdata;
+
+/* A status or open-bus read changes nothing rendering depends on, so the
+ * line is brought up to date only when the read can see the sprite-0 hit
+ * land, or when a mapper or input hook watches the rendering as it goes.
+ * Otherwise the next register access or the end of the line renders it. */
+#define PPU_READ_NEEDS_LINE \
+	(sphitx != 0x100 || PPU_hook || MMC5Hack || InputScanlineHook)
+
 static DECLFR(A2002) {
 	uint8_t ret;
 
-	FCEUPPU_LineUpdate();
+	if (PPU_READ_NEEDS_LINE)
+		FCEUPPU_LineUpdate();
 	ret = PPU_status;
 	ret |= PPUGenLatch & 0x1F;
 
@@ -203,7 +177,8 @@ static DECLFR(A2002) {
 }
 
 static DECLFR(A200x) {	/* Not correct for $2004 reads. */
-	FCEUPPU_LineUpdate();
+	if (PPU_READ_NEEDS_LINE)
+		FCEUPPU_LineUpdate();
 	return PPUGenLatch;
 }
 
@@ -297,8 +272,16 @@ static DECLFW(B2003) {
 	PPUSPL = V & 0x7;
 }
 
+/* For scanlines 0-255, the sprites whose rows cover each line, as bits
+ * by OAM index (lo: 0-31, hi: 32-63), rebuilt when OAM or the sprite
+ * height has changed since. */
+static uint32_t spr_line_lo[256], spr_line_hi[256];
+static uint8_t spr_lines_h;
+static uint8_t spr_lines_dirty = 1;
+
 static DECLFW(B2004) {
 	PPUGenLatch = V;
+	spr_lines_dirty = 1;
 	if (PPUSPL >= 8) {
 		if (PPU[3] >= 8)
 			SPRAM[PPU[3]] = V;
@@ -402,6 +385,8 @@ static void ResetRL(uint8_t *target) {
 }
 
 static uint8_t sprlinebuf[256 + 8];
+/* Columns [spr_xmin, spr_xmax) of sprlinebuf that sprites drew into. */
+static int spr_xmin, spr_xmax;
 
 void FCEUPPU_LineUpdate(void) {
 	if (Pline) {
@@ -432,9 +417,6 @@ static void EndRL(void) {
 	CheckSpriteHit(272);
 	Pline = 0;
 }
-
-static int32_t sphitx;
-static uint8_t sphitdata;
 
 static void CheckSpriteHit(int p) {
 	int l = p - 16;
@@ -523,17 +505,6 @@ static void FASTAPASS(1) RefreshLine(int lastpixel) {
 	Pal[4] |= 64;
 	Pal[8] |= 64;
 	Pal[0xC] |= 64;
-
-	/* Rebuild the bg pair LUT *after* the priority |= 64 modification
-	 * above so that the LUT entries for PALRAM[0/4/8/0xC] carry the
-	 * 0x40 bit while the pputile.h includes below run.  The matching
-	 * Pal[i] &= 63 cleanup at the bottom of this function does NOT
-	 * require a second rebuild: the LUT is only consumed by the
-	 * pputile.h block, which runs between the |= 64 and the &= 63.
-	 * The LUT is also rebuilt at every mid-scanline RefreshLine call
-	 * via FCEUPPU_LineUpdate, picking up any $3F00..$3F0F write the
-	 * CPU made since the previous tile span. */
-	FCEU_BuildBgPairLUT();
 
 	/* This high-level graphics MMC5 emulation code was written for MMC5 carts in "CL" mode.
 	 * It's probably not totally correct for carts in "SL" mode.
@@ -686,7 +657,7 @@ static void Fixit1(void) {
 void MMC5_hb(int);		/* Ugh ugh ugh. */
 static void DoLine(void)
 {
-	int x, colour_emphasis;
+	int x;
 	uint8_t *target = NULL;
 	uint8_t *dtarget = NULL;
 
@@ -732,26 +703,33 @@ static void DoLine(void)
 	if (SpriteON)
 		CopySprites(target);
 
-	if (ScreenON || SpriteON) {	/* Yes, very el-cheapo. */
-		if (PPU[1] & 0x01) {
-			for (x = 63; x >= 0; x--)
-				*(uint32_t*)&target[x << 2] = (*(uint32_t*)&target[x << 2]) & 0x30303030;
+	/* One pass over the line: greyscale (while rendering), then the
+	 * palette bank bits the line's emphasis selects. */
+	{
+		uint32_t and_mask = 0xFFFFFFFFu;
+		uint32_t or_mask;
+
+		if ((ScreenON || SpriteON) && (PPU[1] & 0x01))
+			and_mask = 0x30303030u;
+		if ((PPU[1] >> 5) == 0x7) {
+			and_mask &= 0x3f3f3f3fu;
+			or_mask   = 0xc0c0c0c0u;
+		} else if (PPU[1] & 0xE0)
+			or_mask   = 0x40404040u;
+		else {
+			and_mask &= 0x3f3f3f3fu;
+			or_mask   = 0x80808080u;
+		}
+		for (x = 0; x < 256; x += 4) {
+			uint32_t w;
+			memcpy(&w, target + x, 4);
+			w = (w & and_mask) | or_mask;
+			memcpy(target + x, &w, 4);
 		}
 	}
-	if ((PPU[1] >> 5) == 0x7) {
-		for (x = 63; x >= 0; x--)
-			*(uint32_t*)&target[x << 2] = ((*(uint32_t*)&target[x << 2]) & 0x3f3f3f3f) | 0xc0c0c0c0;
-	} else if (PPU[1] & 0xE0)
-		for (x = 63; x >= 0; x--)
-			*(uint32_t*)&target[x << 2] = (*(uint32_t*)&target[x << 2]) | 0x40404040;
-	else
-		for (x = 63; x >= 0; x--)
-			*(uint32_t*)&target[x << 2] = ((*(uint32_t*)&target[x << 2]) & 0x3f3f3f3f) | 0x80808080;
 
-	/* write the actual colour emphasis */
-	colour_emphasis = ((PPU[1] >> 5) << 24) | ((PPU[1] >> 5) << 16) | ((PPU[1] >> 5) << 8) | ((PPU[1] >> 5) << 0);
-	for (x = 63; x >= 0; x--)
-		*(uint32_t*)&dtarget[x << 2] = colour_emphasis;
+	/* The line's colour emphasis, one byte per pixel. */
+	memset(dtarget, PPU[1] >> 5, 256);
 
     sphitx = 0x100;
 
@@ -802,6 +780,47 @@ void FCEUI_DisableSpriteLimitation(int a) {
 }
 
 static uint8_t numsprites, SpriteBlurp;
+static void BuildSpriteLines(uint8_t H) {
+	int i, t;
+
+	memset(spr_line_lo, 0, sizeof(spr_line_lo));
+	memset(spr_line_hi, 0, sizeof(spr_line_hi));
+	for (i = 0; i < 64; i++) {
+		int y = SPRAM[i << 2];
+		uint32_t bit = (uint32_t)1 << (i & 31);
+		uint32_t *line = (i < 32) ? spr_line_lo : spr_line_hi;
+		for (t = 0; t < H && y + t < 256; t++)
+			line[y + t] |= bit;
+	}
+	spr_lines_h = H;
+	spr_lines_dirty = 0;
+}
+
+/* Index of the lowest set bit of a nonzero word. */
+static const uint8_t spr_debruijn[32] = {
+	0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+	31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
+};
+#define SPR_LOWEST_BIT(m) \
+	spr_debruijn[(((m) & (0u - (m))) * 0x077CB531u) >> 27]
+
+/* Next OAM index from the candidate masks, lowest first; -1 when none
+ * are left. */
+static INLINE int NextSprite(uint32_t *lo, uint32_t *hi) {
+	int i;
+	if (*lo) {
+		i = SPR_LOWEST_BIT(*lo);
+		*lo &= *lo - 1;
+		return i;
+	}
+	if (*hi) {
+		i = 32 + SPR_LOWEST_BIT(*hi);
+		*hi &= *hi - 1;
+		return i;
+	}
+	return -1;
+}
+
 static void FetchSpriteData(void) {
 	uint8_t ns, sb;
 	SPR *spr;
@@ -809,8 +828,9 @@ static void FetchSpriteData(void) {
 	int n;
 	int vofs;
 	uint8_t P0 = PPU[0];
+	uint32_t cand_lo, cand_hi;
+	int i;
 
-	spr = (SPR*)SPRAM;
 	H = 8;
 
 	ns = sb = 0;
@@ -818,13 +838,25 @@ static void FetchSpriteData(void) {
 	vofs = (uint32_t)(P0 & 0x8 & (((P0 & 0x20) ^ 0x20) >> 2)) << 9;
 	H += (P0 & 0x20) >> 2;
 
+	/* Past line 255 (the pre-render line) every sprite is a candidate
+	 * and the range test below decides. */
+	if ((uint32_t)scanline < 256) {
+		if (spr_lines_dirty || spr_lines_h != H)
+			BuildSpriteLines(H);
+		cand_lo = spr_line_lo[scanline];
+		cand_hi = spr_line_hi[scanline];
+	} else
+		cand_lo = cand_hi = 0xFFFFFFFFu;
+
 #ifdef HAVE_HDPACK
 	if (hdnes_active)
 		HDNes_SpriteFetchStart();
 #endif
 
 	if (!PPU_hook)
-		for (n = 63; n >= 0; n--, spr++) {
+		while ((i = NextSprite(&cand_lo, &cand_hi)) >= 0) {
+			spr = (SPR*)SPRAM + i;
+			n = 63 - i;
 			if ((uint32_t)(scanline - spr->y) >= H) continue;
 			if (ns < maxsprites) {
 				if (n == 63) sb = 1;
@@ -890,7 +922,9 @@ static void FetchSpriteData(void) {
 			}
 		}
 	else
-		for (n = 63; n >= 0; n--, spr++) {
+		while ((i = NextSprite(&cand_lo, &cand_hi)) >= 0) {
+			spr = (SPR*)SPRAM + i;
+			n = 63 - i;
 			if ((uint32_t)(scanline - spr->y) >= H) continue;
 
 			if (ns < maxsprites) {
@@ -977,6 +1011,8 @@ static void RefreshSprites(void) {
 	FCEU_dwmemset(sprlinebuf, 0x80808080, 256);
 	numsprites--;
 	spr = (SPRB*)SPRBUF + numsprites;
+	spr_xmin = 256;
+	spr_xmax = 0;
 
 	for (n = numsprites; n >= 0; n--, spr--) {
 		register uint32_t pixdata;
@@ -991,6 +1027,10 @@ static void RefreshSprites(void) {
 		atr = spr->atr;
 
 		if (J) {
+			if (x < spr_xmin)
+				spr_xmin = x;
+			if (x + 8 > spr_xmax)
+				spr_xmax = x + 8;
 			if (n == 0 && SpriteBlurp && !(PPU_status & 0x40)) {
 				sphitx = x;
 				sphitdata = J;
@@ -1084,7 +1124,8 @@ static void RefreshSprites(void) {
 }
 
 static void CopySprites(uint8_t *target) {
-	uint8_t n = ((PPU[1] & 4) ^ 4) << 1;
+	int n = ((PPU[1] & 4) ^ 4) << 1;
+	int end;
 	uint8_t *P = target;
 
 	if (!spork) return;
@@ -1092,9 +1133,17 @@ static void CopySprites(uint8_t *target) {
 
 	if (rendis & 1) return;	/* User asked to not display sprites. */
 
-   do
+	/* Only the 4-byte groups sprites drew into. */
+	if (n < (spr_xmin & ~3))
+		n = spr_xmin & ~3;
+	end = (spr_xmax + 3) & ~3;
+	if (end > 256)
+		end = 256;
+
+	for (; n < end; n += 4)
 	{
-		uint32_t t = *(uint32_t*)(sprlinebuf + n);
+		uint32_t t;
+		memcpy(&t, sprlinebuf + n, 4);
 
 		if (t != 0x80808080) {
 			#ifdef MSB_FIRST
@@ -1140,8 +1189,7 @@ static void CopySprites(uint8_t *target) {
 			}
 			#endif
 		}
-      n += 4;
-	} while(n);
+	}
 }
 
 void FCEUPPU_SetVideoSystem(int w) {
@@ -1177,6 +1225,7 @@ void FCEUPPU_Power(void) {
 	memset(PALRAM, 0x00, 0x20);
 	memset(UPALRAM, 0x00, 0x03);
 	memset(SPRAM, 0x00, 0x100);
+	spr_lines_dirty = 1;
 	FCEUPPU_Reset();
 	for (x = 0x2000; x < 0x4000; x += 8) {
 		ARead[x] = A200x;
@@ -1309,6 +1358,7 @@ int FCEUPPU_Loop(int skip) {
 static uint16_t TempAddrT, RefreshAddrT;
 
 void FCEUPPU_LoadState(int version) {
+	spr_lines_dirty = 1;
 	TempAddr = TempAddrT;
 	RefreshAddr = RefreshAddrT;
 }

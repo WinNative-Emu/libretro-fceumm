@@ -34,6 +34,30 @@ typedef struct {
 	char desc[5];
 } SFORMAT;
 
+/* A chunk kept in the state for state outside the SFORMAT tables, such
+ * as a frontend filter or a sound mode's history. Each slot has its own
+ * chunk type. size() is 0 when there is nothing to keep, and nothing is
+ * written.
+ * save() writes size() bytes, little-endian, straight into the state
+ * buffer; load() reads the chunk where it lies in the loaded buffer and
+ * checks len itself; absent() runs when a loaded state has no chunk. */
+typedef struct
+{
+	size_t (*size)(void);
+	void (*save)(uint8_t *dst);
+	void (*load)(const uint8_t *src, size_t len);
+	void (*absent)(void);
+} fceuss_host_chunk_t;
+
+enum
+{
+	FCEUSS_CHUNK_FRONTEND = 0,  /* the frontend driver's filters */
+	FCEUSS_CHUNK_SOUND,         /* high-quality sound history */
+	FCEUSS_CHUNKS
+};
+
+void FCEUSS_SetHostChunk(int slot, const fceuss_host_chunk_t *hc);
+
 void ResetExState(void (*PreSave)(void), void (*PostSave)(void));
 void AddExState(void *v, uint32_t s, int type, char *desc);
 
